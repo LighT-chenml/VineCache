@@ -1,7 +1,7 @@
 # VineCache
 This is an open source repository for our paper
 
-> **Taming the All-or-Nothing Property in Recommendation Inference with Adaptive and Group-Aware Embedding Caching**
+> ** Adaptive and Group-Aware Embedding Caching for Efficient Deep Recommendation Inference**
 >
 
 ## Brief Introduction
