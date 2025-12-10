@@ -19,7 +19,7 @@ We use a GPU server for evaluation, the detailed information of the server:
 
 ### Clone this repo
 ```sh
-git clone https://anonymous.4open.science/r/VineCache-8DBC
+git clone https://anonymous.4open.science/r/VineCache-711C/
 cd VineCache
 ```
 
