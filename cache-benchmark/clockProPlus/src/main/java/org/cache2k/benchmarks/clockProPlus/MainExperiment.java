@@ -1,13 +1,13 @@
 package org.cache2k.benchmarks.clockProPlus;
 
-import static org.junit.Assert.assertEquals;
-import static org.junit.Assert.assertTrue;
-
 import java.io.*;
 import java.nio.file.*;
 import java.util.*;
 import java.util.stream.Collectors;
 import org.apache.commons.io.FilenameUtils;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertTrue;
 
 /**
  * Cache benchmark experiment runner with support for multiple cache policies
@@ -15,20 +15,28 @@ import org.apache.commons.io.FilenameUtils;
  */
 public class MainExperiment {
     
-    // Configuration constants
-    private static final String BASE_DIR = "/home/xxx/VineCache/cache-benchmark/inf-workload-traces/criteo_kaggle_all_mmap/inference=0.01/";
-    private static final String BENCH_DIR = "caching_bench/";
-    private static final String SUMMARY_DIR = "summary/";
-    private static final String SUMMARY_OUTPUT_DIR = "caching_hit_summary/";
-    private static final int DEFAULT_GROUP_COUNT = 26;
+    // --- Configuration Constants ---
     
-    // Cache capacity percentages for testing
-    private static final float[] CACHE_CAPACITIES = {
+    /** Base directory for workload traces */
+    private static final String BASE_WORKLOAD_DIR = System.getProperty("workload.dir", 
+        "/home/xxx/VineCache/cache-benchmark/inf-workload-traces/criteo_kaggle_all_mmap/inference=0.01/");
+    
+    /** Output directory names */
+    private static final String DIR_BENCHMARK = "caching_bench/";
+    private static final String DIR_SUMMARY = "summary/";
+    private static final String DIR_HIT_SUMMARY = "caching_hit_summary/";
+    
+    /** Default configuration values */
+    private static final int DEFAULT_GROUP_COUNT = 26;
+    private static final int DEFAULT_WARMUP_MULTIPLIER = 100;
+    
+    /** Cache capacity percentages to test */
+    private static final float[] CACHE_CAPACITY_POINTS = {
         0.01f, 0.02f, 0.04f, 0.08f, 0.16f, 0.32f, 0.64f, 
-        1f, 2f, 4f, 8f, 16f, 32f, 64f, 100f
+        1.00f, 2.00f, 4.00f, 8.00f, 16.00f, 32.00f, 64.00f, 100.00f
     };
     
-    // Supported cache policies
+    /** Default policies to run in main */
     private static final String[] DEFAULT_POLICIES = {"SimpleLRU", "VineCache_LRU"};
 
     /**
@@ -53,26 +61,26 @@ public class MainExperiment {
 
     public static ISimpleCache createCacheInstance(String policyName, int size, int groupCount) {
         switch (policyName) {
-            case "SimpleMFU": return new SimpleMFU(size);
+            case "CAR":           return new CAR(size);
+            case "Clock":         return new Clock(size);
+            case "ClockLIRS":     return new ClockLIRS(size, new ClockPro.Tuning());
+            case "ClockNBit":     return new ClockNBit(size, 3);
+            case "ClockPro":      return new ClockPro(size, new ClockPro.Tuning());
+            case "DynamicLIRS":   return new DynamicLIRS(size, new SimpleLIRS.Tuning());
+            case "EvARC":         return new EvARC(size, groupCount);
+            case "EvCAR":         return new EvCAR(size, groupCount);
+            case "EvLFU":         return new EvLFU(size, groupCount);
+            case "LRUK":          return new LRUK(size, 3);
+            case "S3FIFO":        return new S3FIFO(size);
+            case "SimpleARC":     return new SimpleARC(size);
+            case "SimpleFIFO":    return new SimpleFIFO(size);
+            case "SimpleLFU":     return new SimpleLFU(size);
+            case "SimpleLIRS":    return new SimpleLIRS(size, new SimpleLIRS.Tuning());
+            case "SimpleLRU":     return new SimpleLRU(size);
+            case "SimpleMFU":     return new SimpleMFU(size);
+            case "TwoQ":          return new TwoQ(size);
             case "VineCache_LRU": return new VineCache_LRU(size, groupCount);
             case "VineCache_MFU": return new VineCache_MFU(size, groupCount);
-            case "TwoQ": return new TwoQ(size);
-            case "LRUK": return new LRUK(size, 3);
-            case "S3FIFO": return new S3FIFO(size);
-            case "ClockNBit": return new ClockNBit(size, 3);
-            case "EvCAR": return new EvCAR(size, groupCount);
-            case "EvARC": return new EvARC(size, groupCount);
-            case "EvLFU": return new EvLFU(size, groupCount);
-            case "SimpleLRU": return new SimpleLRU(size);
-            case "SimpleLFU": return new SimpleLFU(size);
-            case "DynamicLIRS": return new DynamicLIRS(size, new SimpleLIRS.Tuning());
-            case "SimpleLIRS": return new SimpleLIRS(size, new SimpleLIRS.Tuning());
-            case "SimpleARC": return new SimpleARC(size);
-            case "CAR": return new CAR(size);
-            case "Clock": return new Clock(size);
-            case "ClockLIRS": return new ClockLIRS(size, new ClockPro.Tuning());
-            case "ClockPro": return new ClockPro(size, new ClockPro.Tuning());
-            case "SimpleFIFO": return new SimpleFIFO(size);
             default:
                 throw new IllegalArgumentException("Unsupported cache policy: " + policyName);
         }
@@ -81,73 +89,73 @@ public class MainExperiment {
     /**
      * Read workload data from file with size limit
      */
-    public static List<String> readWorkloadFile(Path filePath, int maxSize) {
-        List<String> workloadKeys = new ArrayList<>();
-        
+    public static List<String> readWorkload(Path filePath, int maxSize) {
         try (BufferedReader reader = Files.newBufferedReader(filePath)) {
-            String header = reader.readLine();
-            System.out.print(header + " ; ");
+            String firstLine = reader.readLine();
+            if (firstLine == null) return Collections.emptyList();
             
-            if (header.contains(",")) {
-                // Handle CSV format with ordered keys
-                workloadKeys = readCsvWorkload(reader, maxSize);
+            System.out.print(firstLine + " ; ");
+            
+            // CSV format typically contains commas, handle accordingly
+            if (firstLine.contains(",")) {
+                return readCsvFormat(reader, maxSize);
             } else {
-                // Handle simple key-per-line format
-                workloadKeys = readSimpleWorkload(reader, maxSize);
+                return readListFormat(reader, maxSize, firstLine);
             }
-            
         } catch (IOException e) {
-            throw new RuntimeException("Failed to read workload file: " + filePath, e);
+            throw new UncheckedIOException("Error reading workload: " + filePath, e);
         }
+    }
+
+    private static List<String> readListFormat(BufferedReader reader, int maxSize, String firstLine) throws IOException {
+        List<String> keys = new ArrayList<>();
+        keys.add(firstLine.trim());
         
-        return workloadKeys;
+        String line;
+        while ((line = reader.readLine()) != null && keys.size() < maxSize) {
+            keys.add(line.trim());
+        }
+        return keys;
     }
-    
-    private static List<String> readSimpleWorkload(BufferedReader reader, int maxSize) throws IOException {
-        return reader.lines()
-                .limit(maxSize)
-                .collect(Collectors.toList());
-    }
-    
-    private static List<String> readCsvWorkload(BufferedReader reader, int maxSize) throws IOException {
+
+    private static List<String> readCsvFormat(BufferedReader reader, int maxSize) throws IOException {
         List<String> keys = new ArrayList<>();
         String line;
-        int count = 0;
         
-        while ((line = reader.readLine()) != null && count < maxSize) {
-            String[] values = line.split(",");
-            if (values.length > 1) {
-                keys.add(values[1]); // Use ordered key column
+        while ((line = reader.readLine()) != null && keys.size() < maxSize) {
+            String[] parts = line.split(",");
+            if (parts.length > 1) {
+                keys.add(parts[1].trim()); // Column 1 is usually the ordered key
             }
-            count++;
         }
-        
         return keys;
     }
 
     /**
      * Write results to file with proper directory creation
      */
-    public static <T> void writeResultsToFile(List<T> data, Path outputPath, String header) {
-        createDirectoriesIfNeeded(outputPath);
+    public static <T> void writeDataToFile(List<T> data, Path path, String header) {
+        ensureDirectoryExists(path);
         
-        try (BufferedWriter writer = Files.newBufferedWriter(outputPath)) {
-            writer.write(header + System.lineSeparator());
+        try (BufferedWriter writer = Files.newBufferedWriter(path)) {
+            if (header != null && !header.isEmpty()) {
+                writer.write(header + System.lineSeparator());
+            }
             for (T item : data) {
-                writer.write(item + System.lineSeparator());
+                writer.write(item.toString() + System.lineSeparator());
             }
         } catch (IOException e) {
-            throw new RuntimeException("Failed to write to file: " + outputPath, e);
+            throw new UncheckedIOException("Error writing to file: " + path, e);
         }
     }
-    
-    private static void createDirectoriesIfNeeded(Path filePath) {
-        Path parentDir = filePath.getParent();
-        if (parentDir != null && !Files.exists(parentDir)) {
+
+    private static void ensureDirectoryExists(Path filePath) {
+        Path parent = filePath.getParent();
+        if (parent != null) {
             try {
-                Files.createDirectories(parentDir);
+                Files.createDirectories(parent);
             } catch (IOException e) {
-                throw new RuntimeException("Failed to create directories: " + parentDir, e);
+                throw new UncheckedIOException("Could not create directory: " + parent, e);
             }
         }
     }
@@ -185,7 +193,7 @@ public class MainExperiment {
         System.out.println("Total workload: " + workloadKeys.size() + " keys");
         System.out.println("Unique keys: " + uniqueKeyCount + " keys");
 
-        for (float capacityPercent : CACHE_CAPACITIES) {
+        for (float capacityPercent : CACHE_CAPACITY_POINTS) {
             int cacheSize = calculateCacheSize(capacityPercent, uniqueKeyCount);
             String capacityStr = formatCapacityString(capacityPercent);
             
@@ -214,19 +222,19 @@ public class MainExperiment {
             result.getHits() + "," + result.getMisses()
         );
         
-        writeResultsToFile(summary, outputDir.resolve(summaryFile), "hit,miss");
-        writeResultsToFile(result.getHitRecord(), outputDir.resolve(fullRecordFile), "hit_or_miss");
+        writeDataToFile(summary, outputDir.resolve(summaryFile), "hit,miss");
+        writeDataToFile(result.getHitRecord(), outputDir.resolve(fullRecordFile), "hit_or_miss");
     }
 
     /**
      * Load all CSV workload files from the base directory
      */
     public static List<String> loadWorkloadFiles() {
-        File baseDir = new File(BASE_DIR);
+        File baseDir = new File(BASE_WORKLOAD_DIR);
         File[] files = baseDir.listFiles();
         
         if (files == null) {
-            throw new RuntimeException("Cannot access base directory: " + BASE_DIR);
+            throw new RuntimeException("Cannot access base directory: " + BASE_WORKLOAD_DIR);
         }
         
         return Arrays.stream(files)
@@ -270,8 +278,8 @@ public class MainExperiment {
         
         System.out.println("Loading workloads...");
         for (String fileName : workloadFiles) {
-            Path filePath = Paths.get(BASE_DIR, fileName);
-            List<String> workload = readWorkloadFile(filePath, totalDataSize);
+            Path filePath = Paths.get(BASE_WORKLOAD_DIR, fileName);
+            List<String> workload = readWorkload(filePath, totalDataSize);
             allWorkloads.add(workload);
         }
         
@@ -332,24 +340,53 @@ public class MainExperiment {
         thread.start();
         
         try {
-            thread.t.join();
+            thread.join();
             long duration = System.nanoTime() - startTime;
             
-            System.out.println("Benchmark completed in: " + duration / 1_000_000_000.0 + " seconds");
+            System.out.printf("Benchmark completed in %.3f seconds%n", duration / 1_000_000_000.0);
             
             return new BenchmarkResult(thread.getRecordHitMiss(), duration);
             
         } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
             throw new RuntimeException("Benchmark interrupted", e);
         }
     }
     
     private static void saveBenchmarkResults(BenchmarkResult result, List<String> workloadFiles,
                                            String algorithmName, int cacheSize, int benchmarkSize) {
-        // Implementation for saving benchmark results
-        // This would include the complex logic from the original method
-        // but in a more organized structure
-        System.out.println("Saving benchmark results for " + algorithmName);
+        
+        Path outputDir = Paths.get(DIR_SUMMARY, algorithmName, String.valueOf(cacheSize));
+        String timestamp = String.valueOf(System.currentTimeMillis());
+        
+        int hits = 0;
+        int total = result.getHitMissRecord().size();
+        for (Boolean hit : result.getHitMissRecord()) {
+            if (hit) hits++;
+        }
+        
+        double hitRate = (double) hits / total;
+        
+        System.out.printf("Results for %s: Hits=%d, Total=%d, HitRate=%.4f, Time=%dms%n", 
+            algorithmName, hits, total, hitRate, result.getDuration() / 1_000_000);
+        
+        List<String> summary = Arrays.asList(
+            "Algorithm," + algorithmName,
+            "CacheSize," + cacheSize,
+            "BenchmarkSize," + benchmarkSize,
+            "Hits," + hits,
+            "Total," + total,
+            "HitRate," + hitRate,
+            "DurationMs," + (result.getDuration() / 1_000_000)
+        );
+        
+        writeDataToFile(summary, outputDir.resolve("experiment_summary_" + timestamp + ".csv"), "Key,Value");
+        
+        List<Integer> bitRecord = result.getHitMissRecord().stream()
+            .map(b -> b ? 1 : 0)
+            .collect(Collectors.toList());
+            
+        writeDataToFile(bitRecord, outputDir.resolve("hit_record_" + timestamp + ".csv"), "hit_or_miss");
     }
 
     /**
@@ -357,27 +394,49 @@ public class MainExperiment {
      */
     public static void main(String[] args) {
         if (args.length < 2) {
-            System.err.println("Usage: MainExperiment <benchmarkSize> <cacheSize>");
-            System.exit(1);
+            System.out.println("Usage: MainExperiment <benchmarkSize> <cacheSize> [warmupEnable]");
+            System.out.println("Using default values: size=100000, cache=1000");
+            runDefaultExperiment(100000, 1000);
+            return;
         }
         
         int benchmarkSize = Integer.parseInt(args[0]);
         int cacheSize = Integer.parseInt(args[1]);
-        boolean enableWarmup = true;
-        int warmupMultiplier = 100;
+        boolean enableWarmup = args.length <= 2 || Boolean.parseBoolean(args[2]);
         
-        System.out.println("=== Cache Benchmark Experiment ===");
-        System.out.println("Benchmark size: " + benchmarkSize);
-        System.out.println("Cache size: " + cacheSize);
+        runExperiment(benchmarkSize, cacheSize, enableWarmup);
+    }
+
+    private static void runDefaultExperiment(int benchmarkSize, int cacheSize) {
+        runExperiment(benchmarkSize, cacheSize, true);
+    }
+
+    private static void runExperiment(int benchmarkSize, int cacheSize, boolean enableWarmup) {
+        System.out.println("=== Starting Cache Benchmark Experiment ===");
+        System.out.println("Configuration:");
+        System.out.println("  Benchmark Size: " + benchmarkSize);
+        System.out.println("  Cache Size:     " + cacheSize);
+        System.out.println("  Warmup Enabled: " + enableWarmup);
+        System.out.println("-------------------------------------------");
         
         List<String> workloadFiles = loadWorkloadFiles();
-        
-        for (String policy : DEFAULT_POLICIES) {
-            runSingleCacheQueueBenchmark(workloadFiles, policy, cacheSize, 
-                                       benchmarkSize, enableWarmup, warmupMultiplier);
+        if (workloadFiles.isEmpty()) {
+            System.err.println("No workload files found in " + BASE_WORKLOAD_DIR);
+            return;
         }
         
-        System.out.println("Benchmark completed successfully!");
+        for (String policy : DEFAULT_POLICIES) {
+            try {
+                runSingleCacheQueueBenchmark(workloadFiles, policy, cacheSize, 
+                                           benchmarkSize, enableWarmup, DEFAULT_WARMUP_MULTIPLIER);
+            } catch (Exception e) {
+                System.err.println("Error running benchmark for " + policy + ": " + e.getMessage());
+                e.printStackTrace();
+            }
+        }
+        
+        System.out.println("-------------------------------------------");
+        System.out.println("Experiment cycle completed successfully.");
     }
 
     // Helper classes for better data organization

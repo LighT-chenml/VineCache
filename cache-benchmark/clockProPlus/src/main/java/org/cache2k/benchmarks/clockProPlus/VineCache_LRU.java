@@ -1,328 +1,310 @@
 package org.cache2k.benchmarks.clockProPlus;
 
 import java.util.*;
-import org.apache.commons.collections4.map.LinkedMap;
 
 /**
- * VineCache_LRU: A multi-level cache with Q-learning based parameter tuning
- * Features:
- * - Hierarchical cache levels based on experience values
- * - Automatic parameter tuning using reinforcement learning
- * - Group-based caching with multi-key requests
+ * A multi-level cache implementation with reinforcement learning (Q-learning) based parameter tuning.
+ *
+ * <p>Key features:
+ * <ul>
+ *   <li>Hierarchical cache levels based on "experience" values.</li>
+ *   <li>Automatic parameter tuning using a Q-learning agent.</li>
+ *   <li>Native support for multi-key (group) requests.</li>
+ * </ul>
  */
 public class VineCache_LRU implements IMultiKeyCache {
     
-    // ==================== Core Configuration ====================
-    private static final int DEFAULT_LEVELS = 30;
-    private static final double[] PRIORITY_RATES = {0.4, 0.8, 0.95};
-    
+    // --- Constants ---
+    private static final int DEFAULT_NUM_LEVELS = 30;
+    private static final double[] PRIORITY_BOUNDARIES = {0.4, 0.8, 0.95};
+
+    // --- Configuration ---
     private final int capacity;
     private final int groupSize;
     private final int numLevels;
-    private final int[] priorityThresholds;
-    private final int[] levelThresholds;
-    
-    // ==================== Cache Data Structures ====================
-    private final List<SimpleLRU> cacheLevels;
-    private final Map<String, Double> experiences;
-    private final Map<String, Integer> accessTimestamps;
+    private final int[] hitThresholds;
+    private final int[] levelBoundaries;
+
+    // --- Core Data Structures ---
+    private final List<SimpleLRU> lruLevels;
+    private final Map<String, Double> experienceMap;
+    private final Map<String, Integer> lastAccessMap;
     private final Random random;
-    
-    // ==================== Cache Statistics ====================
-    private int currentTime;
-    private int evictionCount;
-    private int totalGroupHits;
-    private int totalLevelSum;
-    
-    // ==================== Adaptive Parameters ====================
-    private CacheConfig config;
-    private QLearningAgent qAgent;
+
+    // --- Adaptive Components ---
+    private final CacheConfig config;
+    private final QLearningAgent adaptiveAgent;
+
+    // --- Operational Statistics ---
+    private int globalClock;
+    private int recentEvictions;
+    private int groupHitCount;
+    private int aggregateLevelSum;
     
     // ==================== Constructor ====================
     public VineCache_LRU(int capacity, int groupSize) {
         this.capacity = capacity;
         this.groupSize = groupSize;
-        this.numLevels = DEFAULT_LEVELS;
-        this.random = new Random(19);
-        
-        // Initialize priority thresholds
-        this.priorityThresholds = new int[PRIORITY_RATES.length];
-        for (int i = 0; i < PRIORITY_RATES.length; i++) {
-            priorityThresholds[i] = (int) (PRIORITY_RATES[i] * groupSize);
+        this.numLevels = DEFAULT_NUM_LEVELS;
+        this.random = new Random(42); // Standard seed for reproducibility
+
+        // Initialize thresholds for hit counts
+        this.hitThresholds = new int[PRIORITY_BOUNDARIES.length];
+        for (int i = 0; i < PRIORITY_BOUNDARIES.length; i++) {
+            this.hitThresholds[i] = (int) (PRIORITY_BOUNDARIES[i] * groupSize);
         }
-        
-        // Initialize level thresholds (exponential growth)
-        this.levelThresholds = new int[numLevels - 1];
-        levelThresholds[0] = 8;
-        for (int i = 1; i < numLevels - 1; i++) {
-            levelThresholds[i] = levelThresholds[i - 1] * 2;
+
+        // Initialize exponential boundaries for experience levels
+        this.levelBoundaries = new int[numLevels - 1];
+        levelBoundaries[0] = 8;
+        for (int i = 1; i < levelBoundaries.length; i++) {
+            levelBoundaries[i] = levelBoundaries[i - 1] * 2;
         }
-        
-        // Initialize cache levels
-        this.cacheLevels = new ArrayList<>();
+
+        // Initialize cache hierarchies
+        this.lruLevels = new ArrayList<>(numLevels);
         for (int i = 0; i < numLevels; i++) {
-            cacheLevels.add(new SimpleLRU(capacity));
+            lruLevels.add(new SimpleLRU(capacity));
         }
-        
-        // Initialize data structures
-        this.experiences = new HashMap<>();
-        this.accessTimestamps = new HashMap<>();
-        
-        // Initialize adaptive components
-        this.config = new CacheConfig();
-        this.qAgent = new QLearningAgent();
-        
-        // Initialize statistics
-        this.currentTime = 0;
-        this.evictionCount = 0;
-        this.totalGroupHits = 0;
-        this.totalLevelSum = 0;
+
+        this.experienceMap = new HashMap<>();
+        this.lastAccessMap = new HashMap<>();
+        this.config = new CacheConfig(capacity);
+        this.adaptiveAgent = new QLearningAgent();
+
+        this.globalClock = 0;
+        this.recentEvictions = 0;
+        this.groupHitCount = 0;
+        this.aggregateLevelSum = 0;
     }
     
-    // ==================== Main Request Processing ====================
+    // --- Request Processing ---
+
     @Override
     public List<Boolean> request(List<String> groupKeys) {
-        currentTime++;
+        globalClock++;
         
-        // Process group request
-        GroupRequestResult result = processGroupRequest(groupKeys);
+        GroupRequestResult result = evaluateGroupRequest(groupKeys);
+        applyExperienceUpdates(groupKeys, result);
+        triggerAdaptiveCycle();
         
-        // Update cache based on results
-        updateCacheFromGroupRequest(groupKeys, result);
-        
-        // Perform adaptive tuning if needed
-        performAdaptiveTuning();
-        
-        return result.hitMissRecord;
+        return result.hitMissStatus;
     }
-    
-    private GroupRequestResult processGroupRequest(List<String> groupKeys) {
-        List<Boolean> hitMissRecord = new ArrayList<>();
-        List<Integer> levels = new ArrayList<>();
-        int hitCount = 0;
-        
-        // Check hits/misses and record levels
+
+    private GroupRequestResult evaluateGroupRequest(List<String> groupKeys) {
+        List<Boolean> status = new ArrayList<>(groupKeys.size());
+        List<Integer> levels = new ArrayList<>(groupKeys.size());
+        int totalHits = 0;
+
         for (String key : groupKeys) {
-            if (experiences.containsKey(key)) {
-                hitMissRecord.add(true);
-                hitCount++;
-                levels.add(calculateLevel(experiences.get(key)));
+            boolean isHit = experienceMap.containsKey(key);
+            status.add(isHit);
+            if (isHit) {
+                totalHits++;
+                levels.add(determineLevel(experienceMap.get(key)));
             } else {
-                hitMissRecord.add(false);
                 levels.add(0);
             }
         }
-        
-        // Update group hit statistics
-        if (hitCount == groupSize) {
-            totalGroupHits++;
+
+        if (totalHits == groupSize) {
+            groupHitCount++;
         }
-        
-        return new GroupRequestResult(hitMissRecord, levels, hitCount);
+
+        return new GroupRequestResult(status, levels, totalHits);
     }
-    
-    private void updateCacheFromGroupRequest(List<String> groupKeys, GroupRequestResult result) {
-        // Calculate experience deltas
-        double baseExperience = calculateBaseExperience(result.hitCount);
-        List<Double> experienceDeltas = calculateExperienceDeltas(result.levels, baseExperience);
-        
-        // Update each key
+
+    private void applyExperienceUpdates(List<String> groupKeys, GroupRequestResult result) {
+        double rewardBase = calculateRewardBase(result.hits);
+        List<Double> deltas = computeExperienceDeltas(result.levels, rewardBase);
+
         for (int i = 0; i < groupKeys.size(); i++) {
-            updateKey(groupKeys.get(i), experienceDeltas.get(i));
+            recordAccess(groupKeys.get(i), deltas.get(i));
         }
-        
-        // Handle aging
-        handleAging();
     }
     
     // ==================== Experience Calculation ====================
-    private double calculateBaseExperience(int hitCount) {
-        double experience = calculateAggregateHitExperience(hitCount);
-        return experience * config.ageMultiplier / 100.0;
-    }
-    
-    private double calculateAggregateHitExperience(int hitCount) {
-        if (config.experienceFunction == 0) {
-            return calculateLinearExperience(hitCount);
-        } else {
-            return Math.pow(Math.E, (hitCount - 10) / 2.0);
-        }
-    }
-    
-    private double calculateLinearExperience(int hitCount) {
-        if (hitCount < priorityThresholds[0]) return 0;
-        if (hitCount < priorityThresholds[1]) return hitCount - priorityThresholds[0];
-        if (hitCount < priorityThresholds[2]) {
-            return priorityThresholds[1] - priorityThresholds[0] + 
-                   (hitCount - priorityThresholds[1]) * 2;
-        }
-        return priorityThresholds[1] - priorityThresholds[0] + 
-               (priorityThresholds[2] - priorityThresholds[1]) * 2 + 
-               (hitCount - priorityThresholds[2]) * 8;
-    }
-    
-    private List<Double> calculateExperienceDeltas(List<Integer> levels, double baseExperience) {
-        List<Double> deltas = new ArrayList<>();
+    // --- Experience & Level Calculations ---
+
+    private double calculateRewardBase(int hitCount) {
+        double rawReward = (config.experienceFunction == 0) 
+                ? calculateLinearReward(hitCount) 
+                : Math.pow(Math.E, (hitCount - 10) / 2.0);
         
-        for (int i = 0; i < levels.size(); i++) {
-            int currentLevel = levels.get(i);
-            double mmr = calculateMMR(levels, currentLevel);
-            deltas.add(baseExperience * mmr);
+        return rawReward * config.ageMultiplier / 100.0;
+    }
+
+    private double calculateLinearReward(int hits) {
+        if (hits < hitThresholds[0]) return 0;
+        if (hits < hitThresholds[1]) return hits - hitThresholds[0];
+        
+        if (hits < hitThresholds[2]) {
+            return (hitThresholds[1] - hitThresholds[0]) + (hits - hitThresholds[1]) * 2.0;
         }
         
+        return (hitThresholds[1] - hitThresholds[0]) + 
+               (hitThresholds[2] - hitThresholds[1]) * 2.0 + 
+               (hits - hitThresholds[2]) * 8.0;
+    }
+
+    private List<Double> computeExperienceDeltas(List<Integer> levels, double rewardBase) {
+        List<Double> deltas = new ArrayList<>(levels.size());
+        for (int level : levels) {
+            double mmrFactor = calculateMMRFactor(levels, level);
+            deltas.add(rewardBase * mmrFactor);
+        }
         return deltas;
     }
-    
-    private double calculateMMR(List<Integer> levels, int currentLevel) {
-        int sum = 0;
+
+    private double calculateMMRFactor(List<Integer> levels, int currentLevel) {
+        int cubicSum = 0;
         for (int level : levels) {
             int diff = level - currentLevel;
-            sum += diff * diff * diff;  // Cubic difference
+            cubicSum += (diff * diff * diff);
         }
-        
-        double mmr = 0;
-        if (sum > 0) mmr = Math.log(sum);
-        else if (sum < 0) mmr = -Math.log(-sum);
-        
-        mmr *= config.mmrRate;
-        return sigmoid(mmr);
+
+        double score = 0;
+        if (cubicSum > 0) score = Math.log(cubicSum);
+        else if (cubicSum < 0) score = -Math.log(-cubicSum);
+
+        return sigmoid(score * config.mmrRate);
     }
-    
+
     private double sigmoid(double x) {
-        return 1.0 / (1.0 + Math.pow(Math.E, -x));
+        return 1.0 / (1.0 + Math.exp(-x));
     }
-    
-    // ==================== Cache Level Management ====================
-    private int calculateLevel(double experience) {
+
+    private int determineLevel(double experience) {
         for (int i = 0; i < numLevels - 1; i++) {
-            if (experience <= levelThresholds[i]) {
-                return i;
-            }
+            if (experience <= levelBoundaries[i]) return i;
         }
         return numLevels - 1;
     }
     
-    private void updateKey(String key, double experienceDelta) {
-        if (experiences.containsKey(key)) {
-            updateExistingKey(key, experienceDelta);
+    private void recordAccess(String key, double delta) {
+        if (experienceMap.containsKey(key)) {
+            updateExistingEntry(key, delta);
         } else {
-            insertNewKey(key, experienceDelta);
+            createNewEntry(key, delta);
         }
-        accessTimestamps.put(key, currentTime);
+        lastAccessMap.put(key, globalClock);
+        handleAging();
     }
-    
-    private void updateExistingKey(String key, double experienceDelta) {
-        double oldExperience = experiences.get(key);
-        double newExperience = oldExperience + experienceDelta;
-        int oldLevel = calculateLevel(oldExperience);
-        int newLevel = calculateLevel(newExperience);
+
+    private void updateExistingEntry(String key, double delta) {
+        double oldExp = experienceMap.get(key);
+        double newExp = oldExp + delta;
         
+        int oldLevel = determineLevel(oldExp);
+        int newLevel = determineLevel(newExp);
+
         if (oldLevel != newLevel) {
-            // Move between levels
-            cacheLevels.get(oldLevel).remove(key);
-            cacheLevels.get(newLevel).forceInsert(key);
-            totalLevelSum += newLevel - oldLevel;
+            lruLevels.get(oldLevel).remove(key);
+            lruLevels.get(newLevel).forceInsert(key);
+            aggregateLevelSum += (newLevel - oldLevel);
         } else {
-            // Update within same level
-            cacheLevels.get(oldLevel).hit(key);
+            lruLevels.get(oldLevel).hit(key);
         }
-        
-        experiences.put(key, newExperience);
+
+        experienceMap.put(key, newExp);
     }
-    
-    private void insertNewKey(String key, double experience) {
-        if (experiences.size() >= capacity) {
-            evictKey();
+
+    private void createNewEntry(String key, double exp) {
+        if (experienceMap.size() >= capacity) {
+            performEviction();
         }
-        
-        int level = calculateLevel(experience);
-        experiences.put(key, experience);
-        cacheLevels.get(level).forceInsert(key);
-        totalLevelSum += level;
+
+        int level = determineLevel(exp);
+        experienceMap.put(key, exp);
+        lruLevels.get(level).forceInsert(key);
+        aggregateLevelSum += level;
     }
     
-    // ==================== Eviction Logic ====================
-    private void evictKey() {
-        evictionCount++;
+    // --- Eviction Management ---
+
+    private void performEviction() {
+        recentEvictions++;
         
-        // Find candidates from different levels with random skip
-        List<String> candidates = findEvictionCandidates();
+        List<String> candidates = gatherEvictionCandidates();
+        String targetKey = findLeastRecentlyUsed(candidates);
         
-        // Select the least recently used among candidates
-        String evictKey = selectLRUCandidate(candidates);
-        
-        // Remove from cache
-        removeKey(evictKey);
+        if (targetKey != null) {
+            removeEntry(targetKey);
+        }
     }
-    
-    private List<String> findEvictionCandidates() {
+
+    private List<String> gatherEvictionCandidates() {
         List<String> candidates = new ArrayList<>();
+        int levelIdx = 0;
         
-        for (int i = 0; ; i = (i == numLevels - 1) ? 0 : i + 1) {
-            if (cacheLevels.get(i).getCurrentSize() == 0) continue;
-            
-            String candidate = cacheLevels.get(i).lru.firstKey();
-            candidates.add(candidate);
-            
-            // Random skip mechanism
-            if (random.nextInt(1000) >= config.randomSkipThreshold) {
-                break;
+        while (true) {
+            SimpleLRU level = lruLevels.get(levelIdx);
+            if (level.getCurrentSize() > 0) {
+                candidates.add(level.lru.firstKey());
+                
+                // Random walk termination
+                if (random.nextInt(1000) >= config.randomSkipThreshold) break;
             }
+            
+            levelIdx = (levelIdx + 1) % numLevels;
         }
         
         return candidates;
     }
-    
-    private String selectLRUCandidate(List<String> candidates) {
-        String selected = null;
+
+    private String findLeastRecentlyUsed(List<String> candidates) {
+        String oldestKey = null;
         int earliestTime = Integer.MAX_VALUE;
-        
+
         for (String candidate : candidates) {
-            int accessTime = accessTimestamps.get(candidate);
+            int accessTime = lastAccessMap.getOrDefault(candidate, Integer.MAX_VALUE);
             if (accessTime < earliestTime) {
                 earliestTime = accessTime;
-                selected = candidate;
+                oldestKey = candidate;
             }
         }
-        
-        return selected;
+        return oldestKey;
     }
-    
-    private void removeKey(String key) {
-        double experience = experiences.get(key);
-        int level = calculateLevel(experience);
+
+    private void removeEntry(String key) {
+        double exp = experienceMap.remove(key);
+        lastAccessMap.remove(key);
         
-        cacheLevels.get(level).evict();
-        experiences.remove(key);
-        accessTimestamps.remove(key);
-        totalLevelSum -= level;
+        int level = determineLevel(exp);
+        lruLevels.get(level).remove(key);
+        aggregateLevelSum -= level;
     }
-    
-    // ==================== Adaptive Tuning ====================
-    private void performAdaptiveTuning() {
-        handleAging();
-        
-        if (currentTime % qAgent.tuningFrequency == 0) {
-            qAgent.performTuning(this);
+
+    // --- Adaptive Mechanisms ---
+
+    private void triggerAdaptiveCycle() {
+        if (globalClock % adaptiveAgent.tuningFrequency == 0) {
+            adaptiveAgent.performTuning(this);
         }
     }
-    
+
     private void handleAging() {
-        if (evictionCount > config.agingThreshold) {
+        if (recentEvictions > config.agingThreshold) {
             config.ageMultiplier++;
-            evictionCount = 0;
+            recentEvictions = 0;
         }
     }
     
     // ==================== Utility Methods ====================
+    /**
+     * Prints the distribution of entries across different cache levels.
+     */
     public void printLevelDistribution() {
         int[] distribution = new int[numLevels];
-        for (double experience : experiences.values()) {
-            distribution[calculateLevel(experience)]++;
+        for (double exp : experienceMap.values()) {
+            distribution[determineLevel(exp)]++;
         }
         
+        System.out.println("--- Level Distribution ---");
         for (int i = 0; i < numLevels; i++) {
-            System.out.println("Level " + i + ": " + distribution[i]);
+            if (distribution[i] > 0) {
+                System.out.printf("Level %2d: %d entries%n", i, distribution[i]);
+            }
         }
     }
     
@@ -339,137 +321,126 @@ public class VineCache_LRU implements IMultiKeyCache {
     
     // ==================== Inner Classes ====================
     private static class GroupRequestResult {
-        final List<Boolean> hitMissRecord;
+        final List<Boolean> hitMissStatus;
         final List<Integer> levels;
-        final int hitCount;
-        
-        GroupRequestResult(List<Boolean> hitMissRecord, List<Integer> levels, int hitCount) {
-            this.hitMissRecord = hitMissRecord;
+        final int hits;
+
+        GroupRequestResult(List<Boolean> status, List<Integer> levels, int hits) {
+            this.hitMissStatus = status;
             this.levels = levels;
-            this.hitCount = hitCount;
+            this.hits = hits;
         }
     }
-    
+
     private static class CacheConfig {
-        int experienceFunction = 0;          // 0: linear, 1: exponential
-        double mmrRate = 0.3;                // MMR calculation rate
-        int agingThreshold;                  // Threshold for aging
-        int randomSkipThreshold = 50;        // Random skip probability (out of 1000)
-        int ageMultiplier = 100;             // Age multiplier for experience
-        
-        CacheConfig() {
-            // agingThreshold will be set based on capacity
-        }
-        
-        void initialize(int capacity) {
+        int experienceFunction = 0; // 0: linear, 1: exponential
+        double mmrRate = 0.3;
+        int agingThreshold;
+        int randomSkipThreshold = 50; // out of 1000
+        int ageMultiplier = 100;
+
+        CacheConfig(int capacity) {
             this.agingThreshold = (int) (capacity * 0.1);
         }
     }
     
     private static class QLearningAgent {
-        // Q-Learning parameters
-        private static final int FUNC_BUCKETS = 2;
-        private static final int MMR_BUCKETS = 10;
-        private static final int AGING_BUCKETS = 10;
-        private static final int SKIP_BUCKETS = 10;
-        private static final int LEVEL_BUCKETS = 30;
-        private static final int STATE_SPACE = FUNC_BUCKETS * MMR_BUCKETS * AGING_BUCKETS * SKIP_BUCKETS * LEVEL_BUCKETS;
+        // --- State/Action Space Config ---
+        private static final int BUCKETS_FUNC = 2;
+        private static final int BUCKETS_MMR = 10;
+        private static final int BUCKETS_AGING = 10;
+        private static final int BUCKETS_SKIP = 10;
+        private static final int BUCKETS_LEVEL = 30;
+
+        private static final int STATE_SPACE = BUCKETS_FUNC * BUCKETS_MMR * BUCKETS_AGING * BUCKETS_SKIP * BUCKETS_LEVEL;
         private static final int ACTION_SPACE = 54;
-        
-        private final double[][] qTable;
+
+        // --- Agent State ---
+        private final double[][] qTable = new double[STATE_SPACE][ACTION_SPACE];
         private final Random random = new Random();
-        
-        private int currentState = -1;
-        private int currentAction = -1;
-        private int lastGroupHits = 0;
-        private int lastPeriodHits = 0;
-        
-        // Learning parameters
+
+        private int lastStateIdx = -1;
+        private int lastActionIdx = -1;
+        private int lastCheckpointHits = 0;
+        private int lastPeriodGroupHits = 0;
+
+        // --- Hyperparameters ---
         private double learningRate = 0.1;
         private double discountFactor = 0.99;
         private double explorationRate = 0.1;
-        private final double minExplorationRate = 0.01;
+        private final double explorationMin = 0.01;
         private final double explorationDecay = 0.001;
-        
+
         final int tuningFrequency = 10000;
-        
-        QLearningAgent() {
-            this.qTable = new double[STATE_SPACE][ACTION_SPACE];
-            // Q-table is initialized to zeros by default
-        }
-        
+
         void performTuning(VineCache_LRU cache) {
-            int newState = calculateState(cache);
-            double reward = calculateReward(cache);
-            
-            if (currentState != -1) {
-                updateQValue(newState, reward);
+            int newStateIdx = computeStateIndex(cache);
+            double reward = computeReward(cache);
+
+            if (lastStateIdx != -1) {
+                updateQValue(newStateIdx, reward);
             }
-            
-            int action = selectAction(newState);
-            applyAction(action, cache.config);
-            
-            currentState = newState;
-            currentAction = action;
-            
-            // Decay exploration rate
-            explorationRate = Math.max(minExplorationRate, explorationRate - explorationDecay);
+
+            int nextActionIdx = selectAction(newStateIdx);
+            applyAction(nextActionIdx, cache.config);
+
+            lastStateIdx = newStateIdx;
+            lastActionIdx = nextActionIdx;
+            explorationRate = Math.max(explorationMin, explorationRate - explorationDecay);
         }
-        
-        private int calculateState(VineCache_LRU cache) {
-            int funcBucket = cache.config.experienceFunction;
-            int mmrBucket = Math.min(9, (int)(cache.config.mmrRate / 0.1));
-            int agingBucket = Math.min(9, (int)(cache.config.agingThreshold / (cache.capacity * 0.01)));
-            int skipBucket = Math.min(9, cache.config.randomSkipThreshold / 10);
-            int levelBucket = cache.experiences.isEmpty() ? 0 : 
-                             Math.min(29, cache.totalLevelSum / cache.experiences.size());
-            
-            return funcBucket * (MMR_BUCKETS * AGING_BUCKETS * SKIP_BUCKETS * LEVEL_BUCKETS) + 
-                   mmrBucket * (AGING_BUCKETS * SKIP_BUCKETS * LEVEL_BUCKETS) + 
-                   agingBucket * (SKIP_BUCKETS * LEVEL_BUCKETS) +
-                   skipBucket * LEVEL_BUCKETS +
-                   levelBucket;
+
+        private int computeStateIndex(VineCache_LRU cache) {
+            int fIdx = cache.config.experienceFunction;
+            int mIdx = Math.min(9, (int) (cache.config.mmrRate / 0.1));
+            int aIdx = Math.min(9, (int) (cache.config.agingThreshold / (cache.capacity * 0.01)));
+            int sIdx = Math.min(9, cache.config.randomSkipThreshold / 10);
+            int lIdx = cache.experienceMap.isEmpty() ? 0 : 
+                       Math.min(29, cache.aggregateLevelSum / cache.experienceMap.size());
+
+            return fIdx * (BUCKETS_MMR * BUCKETS_AGING * BUCKETS_SKIP * BUCKETS_LEVEL) +
+                   mIdx * (BUCKETS_AGING * BUCKETS_SKIP * BUCKETS_LEVEL) +
+                   aIdx * (BUCKETS_SKIP * BUCKETS_LEVEL) +
+                   sIdx * BUCKETS_LEVEL +
+                   lIdx;
         }
-        
-        private double calculateReward(VineCache_LRU cache) {
-            int currentGroupHits = cache.totalGroupHits - lastGroupHits;
-            double reward = currentGroupHits - lastPeriodHits;
-            
-            lastGroupHits = cache.totalGroupHits;
-            lastPeriodHits = currentGroupHits;
-            
+
+        private double computeReward(VineCache_LRU cache) {
+            int currentHits = cache.groupHitCount - lastCheckpointHits;
+            double reward = currentHits - lastPeriodGroupHits;
+
+            lastCheckpointHits = cache.groupHitCount;
+            lastPeriodGroupHits = currentHits;
+
             return reward;
         }
         
-        private void updateQValue(int newState, double reward) {
-            int bestNextAction = getBestAction(newState);
-            double currentQ = qTable[currentState][currentAction];
-            double maxNextQ = qTable[newState][bestNextAction];
-            
-            qTable[currentState][currentAction] = currentQ + 
-                learningRate * (reward + discountFactor * maxNextQ - currentQ);
+        private void updateQValue(int newStateIdx, double reward) {
+            int nextBestAction = findBestAction(newStateIdx);
+            double currentQ = qTable[lastStateIdx][lastActionIdx];
+            double maxFutureQ = qTable[newStateIdx][nextBestAction];
+
+            qTable[lastStateIdx][lastActionIdx] = currentQ + 
+                learningRate * (reward + discountFactor * maxFutureQ - currentQ);
         }
-        
-        private int selectAction(int state) {
+
+        private int selectAction(int stateIdx) {
             if (random.nextDouble() < explorationRate) {
                 return random.nextInt(ACTION_SPACE);
-            } else {
-                return getBestAction(state);
             }
+            return findBestAction(stateIdx);
         }
-        
-        private int getBestAction(int state) {
-            int bestAction = 0;
-            double bestValue = qTable[state][0];
-            
+
+        private int findBestAction(int stateIdx) {
+            int bestIdx = 0;
+            double maxVal = qTable[stateIdx][0];
+
             for (int i = 1; i < ACTION_SPACE; i++) {
-                if (qTable[state][i] > bestValue) {
-                    bestValue = qTable[state][i];
-                    bestAction = i;
+                if (qTable[stateIdx][i] > maxVal) {
+                    maxVal = qTable[stateIdx][i];
+                    bestIdx = i;
                 }
             }
-            
-            return bestAction;
+            return bestIdx;
         }
         
         private void applyAction(int action, CacheConfig config) {

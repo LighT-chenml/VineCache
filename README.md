@@ -1,7 +1,7 @@
 # VineCache
 This is an open source repository for our paper
 
-> **Adaptive and Group-Aware Embedding Caching for Efficient Deep Recommendation Inference**
+> **Bridging the Granularity Gap: Adaptive and Group-Aware Embedding Caching for Deep Recommendation Inference**
 >
 
 ## Brief Introduction

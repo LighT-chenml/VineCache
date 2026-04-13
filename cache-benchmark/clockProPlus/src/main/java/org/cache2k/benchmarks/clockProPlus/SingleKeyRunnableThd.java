@@ -10,31 +10,32 @@ import java.util.Random;
  */
 public class SingleKeyRunnableThd implements Runnable {
     
-    // Thread management
-    private Thread thread;
+    // Constants
+    private static final int ITEMS_PER_GROUP = 26; // Default grouping for hit distribution
+
+    // Execution State
+    protected Thread executorThread;
     private final String threadName;
+
+    // Cache and Workload Details
+    protected final ISimpleCache cache;
+    protected final List<String> workloadKeys;
+    protected final int benchmarkWorkloadSize;
+
+    // Statistics and Collections
+    protected int localHitCount = 0;
+    protected final ArrayList<Boolean> recordHitMiss = new ArrayList<>();
+    protected final List<Integer> hitCountDistribution = new ArrayList<>();
     
-    // Cache and workload
-    private final ISimpleCache cache;
-    private final List<String> workloadKeys;
-    private final int benchmarkWorkloadSize;
-    
-    // Performance tracking
-    private int localHitCount = 0;
-    private final List<Boolean> hitMissRecord = new ArrayList<>();
-    private final List<Integer> hitCountDistribution = new ArrayList<>();
-    
-    // Configuration constants
-    private static final int EVALUATION_TABLE_SIZE = 26;
-    private final int groupSize = EVALUATION_TABLE_SIZE;
+
     
     /**
-     * Creates a new benchmark thread.
-     * 
-     * @param name Thread name for identification
-     * @param cache Cache instance to benchmark
-     * @param workloadKeys List of keys to use in benchmark
-     * @param benchmarkWorkloadSize Size of the benchmark workload
+     * Initializes a benchmark thread with the specified cache and workload.
+     *
+     * @param name                  The name of the thread.
+     * @param cache                 The cache implementation to benchmark.
+     * @param workloadKeys          The complete sequence of keys for the benchmark.
+     * @param benchmarkWorkloadSize The number of operations to perform in the evaluation phase.
      */
     public SingleKeyRunnableThd(String name, ISimpleCache cache, 
                                List<String> workloadKeys, int benchmarkWorkloadSize) {
@@ -42,138 +43,116 @@ public class SingleKeyRunnableThd implements Runnable {
         this.cache = cache;
         this.workloadKeys = workloadKeys;
         this.benchmarkWorkloadSize = benchmarkWorkloadSize;
-        
-        // Initialize hit count distribution tracking
-        for (int i = 0; i <= groupSize; i++) {
+
+        initializeDistributionTracking();
+        System.out.println("[Benchmark] Created thread: " + name);
+    }
+
+    private void initializeDistributionTracking() {
+        hitCountDistribution.clear();
+        for (int i = 0; i <= ITEMS_PER_GROUP; i++) {
             hitCountDistribution.add(0);
         }
-        
-        System.out.println("Created benchmark thread: " + this.threadName);
     }
     
     /**
      * Returns the number of cache hits recorded by this thread.
      */
-    public int getLocalHitCount() {
-        return localHitCount;
+    public ArrayList<Boolean> getRecordHitMiss() {
+        return recordHitMiss;
     }
     
     /**
-     * Returns the detailed hit/miss record for each request.
+     * Performs a sequential warm-up of the cache using a portion of the workload.
+     *
+     * @param warmUpPercentage Percentage of benchmark workload to use (0-100).
      */
-    public List<Boolean> getHitMissRecord() {
-        return hitMissRecord;
-    }
-    
-    /**
-     * Warms up the cache using sequential access pattern.
-     * 
-     * @param warmUpPercentage Percentage of workload to use for warm-up (0-100)
-     */
-    public void warmUpCacheSequentially(int warmUpPercentage) {
-        System.out.println("Starting sequential warm-up with " + warmUpPercentage + "% of workload");
-        
-        int warmUpSize = benchmarkWorkloadSize * warmUpPercentage / 100 * EVALUATION_TABLE_SIZE;
-        
-        for (int i = 0; i < warmUpSize && i < workloadKeys.size(); i++) {
+    public void warmUpTheCache(int warmUpPercentage) {
+        int warmUpCount = (benchmarkWorkloadSize * warmUpPercentage / 100) * ITEMS_PER_GROUP;
+        System.out.println("[Warm-up] Sequential start (" + warmUpPercentage + "%, size=" + warmUpCount + ")");
+
+        for (int i = 0; i < warmUpCount && i < workloadKeys.size(); i++) {
             cache.request(workloadKeys.get(i));
         }
-        
-        System.out.println("Sequential warm-up completed");
+        System.out.println("[Warm-up] Sequential completed.");
     }
     
     /**
-     * Warms up the cache using random access pattern.
-     * 
-     * @param multiplier Multiple of cache size to use for warm-up
+     * Performs a random warm-up of the cache using keys from the workload.
+     *
+     * @param multiplier Number of times the cache size to request.
      */
     public void warmUpCacheRandomly(int multiplier) {
-        int warmUpSize = cache.getCacheSize() * multiplier;
-        
-        System.out.println("Starting random warm-up with " + multiplier + "x cache size");
-        System.out.println("Warm-up size: " + warmUpSize + ", Available keys: " + workloadKeys.size());
-        
-        if (warmUpSize >= workloadKeys.size()) {
-            // Use sequential access if warm-up size exceeds available keys
-            System.out.println("Using sequential access (warm-up size >= available keys)");
-            for (int i = 0; i < workloadKeys.size(); i++) {
-                cache.request(workloadKeys.get(i));
-            }
+        int warmUpCount = cache.getCacheSize() * multiplier;
+        System.out.println("[Warm-up] Random start (" + multiplier + "x cache size, count=" + warmUpCount + ")");
+
+        if (warmUpCount >= workloadKeys.size()) {
+            System.out.println("[Warm-up] Switching to sequential (count exceeds available keys).");
+            workloadKeys.forEach(cache::request);
         } else {
-            // Use random access
-            Random random = new Random(warmUpSize); // Use warm-up size as seed for reproducibility
-            int maxIndex = workloadKeys.size() - 1;
-            
-            for (int i = 0; i < warmUpSize; i++) {
-                int randomIndex = random.nextInt(maxIndex);
-                cache.request(workloadKeys.get(randomIndex));
+            Random random = new Random(warmUpCount); 
+            int bound = workloadKeys.size();
+            for (int i = 0; i < warmUpCount; i++) {
+                cache.request(workloadKeys.get(random.nextInt(bound)));
             }
         }
-        
-        System.out.println("Random warm-up completed");
+        System.out.println("[Warm-up] Random completed.");
     }
     
     /**
-     * Outputs the cumulative distribution function of hit counts.
+     * Records and prints the Cumulative Distribution Function (CDF) of hit counts.
      */
     public void printHitCountCDF() {
-        System.out.println("Hit Count CDF:");
-        
-        int totalSamples = hitCountDistribution.stream().mapToInt(Integer::intValue).sum();
-        double cumulativeProbability = 0.0;
-        
-        // Print CDF in descending order
-        for (int i = groupSize; i >= 0; i--) {
-            cumulativeProbability += (double) hitCountDistribution.get(i) / totalSamples;
-            System.out.printf("P(hits >= %d) = %.4f%n", i, cumulativeProbability);
+        int totalGroups = hitCountDistribution.stream().mapToInt(Integer::intValue).sum();
+        if (totalGroups == 0) return;
+
+        System.out.println("[Stats] Hit Count CDF:");
+        double cumulativeProb = 0.0;
+        for (int i = ITEMS_PER_GROUP; i >= 0; i--) {
+            cumulativeProb += (double) hitCountDistribution.get(i) / totalGroups;
+            System.out.printf("  P(hits >= %d) = %.4f%n", i, cumulativeProb);
         }
     }
-    
-    /**
-     * Main benchmark execution logic.
-     * Processes the benchmark workload and records performance metrics.
-     */
+
     @Override
     public void run() {
-        int totalRequests = 0;
-        int currentGroupHits = 0;
-        
-        // Calculate the starting index for benchmark portion of workload
-        int startIndex = workloadKeys.size() - (benchmarkWorkloadSize * EVALUATION_TABLE_SIZE);
-        
-        // Process each key in the benchmark workload
+        int totalProcessed = 0;
+        int groupHits = 0;
+        int startIndex = Math.max(0, workloadKeys.size() - (benchmarkWorkloadSize * ITEMS_PER_GROUP));
+
         for (int i = startIndex; i < workloadKeys.size(); i++) {
-            totalRequests++;
-            
-            // Make cache request and record result
+            totalProcessed++;
             boolean isHit = cache.request(workloadKeys.get(i));
-            hitMissRecord.add(isHit);
-            
+            recordHitMiss.add(isHit);
+
             if (isHit) {
                 localHitCount++;
-                currentGroupHits++;
+                groupHits++;
             }
-            
-            // Record hit count distribution every groupSize requests
-            if (totalRequests % groupSize == 0) {
-                int currentCount = hitCountDistribution.get(currentGroupHits);
-                hitCountDistribution.set(currentGroupHits, currentCount + 1);
-                currentGroupHits = 0;
+
+            // Update distribution every group interval
+            if (totalProcessed % ITEMS_PER_GROUP == 0) {
+                hitCountDistribution.set(groupHits, hitCountDistribution.get(groupHits) + 1);
+                groupHits = 0;
             }
         }
-        
-        System.out.println("Thread " + threadName + " completed. Total hits: " + localHitCount);
+        System.out.println("[Execution] Thread " + threadName + " completed. Total Hits: " + localHitCount);
     }
     
+    public void join() throws InterruptedException {
+        if (executorThread != null) {
+            executorThread.join();
+        }
+    }
+
     /**
-     * Starts the benchmark thread execution.
+     * Starts the asynchronous execution of the benchmark.
      */
     public void start() {
-        System.out.println("Starting thread: " + threadName);
-        
-        if (thread == null) {
-            thread = new Thread(this, threadName);
-            thread.start();
+        System.out.println("[Execution] Starting thread: " + threadName);
+        if (executorThread == null) {
+            executorThread = new Thread(this, threadName);
+            executorThread.start();
         }
     }
 }

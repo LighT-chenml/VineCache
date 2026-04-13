@@ -1,13 +1,12 @@
-# Copyright (c) Facebook, Inc. and its affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Description: Deep Learning Recommendation Model (DLRM) implementation
-# The model processes dense and sparse features through MLPs and embedding lookups
+"""
+Deep Learning Recommendation Model (DLRM) implementation.
+The model processes dense and sparse features through MLPs and embedding lookups.
+Features integration with VineCache for high-performance embedding retrieval.
+"""
 
 from __future__ import absolute_import, division, print_function, unicode_literals
 
+# Standard library imports
 import argparse
 import builtins
 import datetime
@@ -16,13 +15,31 @@ import sys
 import time
 import csv
 import os
-import pandas as pd
-from collections import OrderedDict
 import struct
+import warnings
+import subprocess
 from pathlib import Path
+from collections import OrderedDict
+
+# Third-party imports
+import pandas as pd
+import numpy as np
+import sklearn.metrics
 from tqdm import tqdm
 
-# Add custom module paths
+# PyTorch imports
+import torch
+import torch.nn as nn
+from torch._ops import ops
+from torch.autograd.profiler import record_function
+from torch.nn.parallel.parallel_apply import parallel_apply
+from torch.nn.parallel.replicate import replicate
+from torch.nn.parallel.scatter_gather import gather, scatter
+from torch.nn.parameter import Parameter
+from torch.optim.lr_scheduler import _LRScheduler
+from torch.utils.tensorboard import SummaryWriter
+
+# Custom module paths setup
 sys.path.extend([
     'emb_storage',
     'cache_algo',
@@ -33,55 +50,34 @@ sys.path.extend([
     'cache_algo/VineCache_MFU_Cython'
 ])
 
-# Import cache algorithms
+# Cache and Storage imports
 import EvLFU
 import LRU
 import LFU
 import FIFO
 import storage_manager
 import evstore_utils
-import subprocess
-
-# Import Cython implementations
 import EvLFU_Cython
 import FIFO_Cython
 import LRU_Cython
 import VineCache_Cython
 import VineCache_MFU_Cython
 
-import warnings
+# DLRM specific modules
 import dlrm_data_pytorch as dp
 import extend_distributed as ext_dist
-
-# Scientific computing
-import numpy as np
-import sklearn.metrics
-
-# PyTorch
-import torch
-import torch.nn as nn
-from torch._ops import ops
-from torch.autograd.profiler import record_function
-from torch.nn.parallel.parallel_apply import parallel_apply
-from torch.nn.parallel.replicate import replicate
-from torch.nn.parallel.scatter_gather import gather, scatter
-from torch.nn.parameter import Parameter
-from torch.optim.lr_scheduler import _LRScheduler
 import optim.rwsadagrad as RowWiseSparseAdagrad
-from torch.utils.tensorboard import SummaryWriter
-
-# Embedding tricks
 from tricks.md_embedding_bag import PrEmbeddingBag, md_solver
 from tricks.qr_embedding_bag import QREmbeddingBag
 
-# Global constants
+# --- Global Constants ---
 STORED_MODEL_PATH = "stored_model"
 DEFAULT_EPOCH = "epoch-00"
 TRAIN_FILE = "train.txt"
 TEST_FILE = "test.txt"
 AUC_METRICS_FILE = "metrics.txt"
 
-# Global variables for metrics
+# --- Performance Counters ---
 perfect_hit = 0
 total_hit = 0
 key_counter = set()
@@ -89,25 +85,32 @@ request_cnt = 0
 
 
 def time_wrap(use_gpu):
-    """Synchronized time measurement for GPU/CPU"""
+    """
+    Synchronized time measurement for GPU/CPU.
+    """
     if use_gpu:
         torch.cuda.synchronize()
     return time.time()
 
 
 def dlrm_wrap(X, lS_o, lS_i, use_gpu, device, is_warmup, ndevices=1):
-    """Wrapper for DLRM forward pass with device handling"""
+    """
+    Wrapper for DLRM forward pass with device handling and activity recording.
+    """
     with record_function("DLRM forward"):
         if use_gpu and ndevices == 1:
-            # Move sparse indices and offsets to device
+            # Transfer sparse features to the target device
             lS_i = [S_i.to(device) for S_i in lS_i] if isinstance(lS_i, list) else lS_i.to(device)
             lS_o = [S_o.to(device) for S_o in lS_o] if isinstance(lS_o, list) else lS_o.to(device)
         return dlrm(X.to(device), lS_o, lS_i, is_warmup)
 
 
 def unpack_batch(batch):
-    """Unpack batch data for training/testing"""
-    return batch[0], batch[1], batch[2], batch[3], torch.ones(batch[3].size()), None
+    """
+    Helper to unpack batch components for processing.
+    """
+    X, lS_o, lS_i, targets = batch[0], batch[1], batch[2], batch[3]
+    return X, lS_o, lS_i, targets, torch.ones(targets.size()), None
 
 
 def apply_emb_ori_dlrm(lS_o, lS_i, emb_l, v_W_l):
@@ -132,54 +135,91 @@ def apply_emb_ori_dlrm(lS_o, lS_i, emb_l, v_W_l):
 
 
 def apply_emb_evstore(lS_o, lS_i, emb_l, v_W_l, is_warmup, use_gpu=False, 
-                     use_emb_cache=False, approx_emb_threshold=-1):
-    """EVStore embedding lookup with caching support"""
+                      use_emb_cache=False, approx_emb_threshold=-1):
+    """
+    Retrieves embeddings using EVStore with optional caching support.
+    Dispatches requests to various cache algorithms.
+    Handles both single-feature and multi-feature batches.
+    """
     global cache_algo
     
-    ly = []
-    if use_gpu:
-        lS_i = lS_i.cpu().data
+    device = torch.device("cuda:0") if use_gpu else torch.device("cpu")
     
-    # Extract row IDs for each embedding table
-    group_rowIds = [sparse_index[0] for sparse_index in lS_i.numpy()]
+    # Standardize lS_i into a list of numpy arrays (one per feature)
+    if isinstance(lS_i, list):
+        lS_i_list = [S_i.cpu().detach().numpy() for S_i in lS_i]
+    else:
+        # If it's a tensor of shape (batch_size, num_features)
+        lS_i_cpu = lS_i.cpu().detach().numpy()
+        if len(lS_i_cpu.shape) == 1:
+            lS_i_list = [lS_i_cpu]
+        else:
+            lS_i_list = [lS_i_cpu[:, i] for i in range(lS_i_cpu.shape[1])]
+    
+    batch_size = len(lS_i_list[0])
+    num_features = len(lS_i_list)
+    
+    all_ly = []
+    g_total_hit = 0
+    g_perfect_hit = 0
+    
+    # Process each sample in the batch
+    # Note: Optimization might be needed for large batches, 
+    # but this ensures correctness given the current EVStore interface.
+    for b in range(batch_size):
+        group_row_ids = [int(lS_i_list[f][b]) for f in range(num_features)]
+        
+        if use_emb_cache:
+            # Dispatch table for cache implementations
+            cache_handlers = {
+                "evlfu":                lambda: EvLFU.request_to_ev_lfu(group_row_ids, use_gpu, approx_emb_threshold),
+                "lru":                  lambda: LRU.request_to_lru(group_row_ids, use_gpu),
+                "lfu":                  lambda: LFU.request_to_lfu(group_row_ids, use_gpu),
+                "fifo":                 lambda: FIFO.request_to_fifo(group_row_ids, use_gpu),
+                "evlfu_cython":         lambda: EvLFU_Cython.crequest(group_row_ids, is_warmup, use_gpu),
+                "fifo_cython":          lambda: FIFO_Cython.crequest(group_row_ids, is_warmup, use_gpu),
+                "lru_cython":           lambda: LRU_Cython.crequest(group_row_ids, is_warmup, use_gpu),
+                "vinecache_cython":     lambda: VineCache_Cython.crequest(group_row_ids, is_warmup, use_gpu),
+                "vinecache_mfu_cython": lambda: VineCache_MFU_Cython.crequest(group_row_ids, is_warmup, use_gpu)
+            }
+            
+            if cache_algo in cache_handlers:
+                resp = cache_handlers[cache_algo]()
+                
+                if cache_algo.endswith("_cython"):
+                    t_hit, p_hit, emb_data = resp
+                    # emb_data is vector[vector[float]], size (num_features, m_spa)
+                    sample_ly = [torch.FloatTensor(emb_data[i]).to(device) for i in range(len(emb_data))]
+                else:
+                    t_hit, p_hit, sample_ly = resp
+                
+                g_total_hit += t_hit
+                g_perfect_hit += p_hit
+                all_ly.append(sample_ly)
+            else:
+                raise ValueError(f"[DLRM] Unsupported cache algorithm: {cache_algo}")
+        else:
+            # Direct fallback to storage manager
+            _, sample_ly = storage_manager.request_to_emb_storage(group_row_ids, use_gpu)
+            all_ly.append(sample_ly)
+    
+    # Reconstruct ly from all_ly
+    # all_ly is (batch_size, num_features) tensors of shape (1, m_spa) or (m_spa,)
+    # We need ly: (num_features) list of tensors of shape (batch_size, m_spa)
+    final_ly = []
+    for f in range(num_features):
+        feature_tensors = []
+        for b in range(batch_size):
+            t = all_ly[b][f]
+            if t.dim() == 1:
+                t = t.unsqueeze(0)
+            feature_tensors.append(t)
+        final_ly.append(torch.cat(feature_tensors, dim=0))
     
     if use_emb_cache:
-        time_begin = time_wrap(use_gpu)
-        device = torch.device("cuda:0") if use_gpu else torch.device("cpu")
-        
-        # Cache algorithm dispatch
-        cache_functions = {
-            "evlfu": lambda: EvLFU.request_to_ev_lfu(group_rowIds, use_gpu, approx_emb_threshold),
-            "lru": lambda: LRU.request_to_lru(group_rowIds, use_gpu),
-            "lfu": lambda: LFU.request_to_lfu(group_rowIds, use_gpu),
-            "fifo": lambda: FIFO.request_to_fifo(group_rowIds, use_gpu),
-            "evlfu_cython": lambda: EvLFU_Cython.crequest(group_rowIds, is_warmup, use_gpu),
-            "fifo_cython": lambda: FIFO_Cython.crequest(group_rowIds, is_warmup, use_gpu),
-            "lru_cython": lambda: LRU_Cython.crequest(group_rowIds, is_warmup, use_gpu),
-            "vinecache_cython": lambda: VineCache_Cython.crequest(group_rowIds, is_warmup, use_gpu),
-            "vinecache_mfu_cython": lambda: VineCache_MFU_Cython.crequest(group_rowIds, is_warmup, use_gpu)
-        }
-        
-        if cache_algo in cache_functions:
-            result = cache_functions[cache_algo]()
-            
-            if cache_algo.endswith("_cython"):
-                group_total_hit, group_perfect_hit, tmp = result
-                ly = [torch.FloatTensor([tmp[i]]).to(device) if use_gpu 
-                     else torch.FloatTensor([tmp[i]]) for i in range(len(tmp))]
-            else:
-                group_total_hit, group_perfect_hit, ly = result
-        else:
-            raise ValueError(f"Unsupported cache algorithm: {cache_algo}")
-        
-        time_end = time_wrap(use_gpu)
-        lookup_time = time_end - time_begin
-        
-        return group_total_hit, group_perfect_hit, ly
+        return g_total_hit, g_perfect_hit, final_ly
     else:
-        # Direct storage access
-        _, ly = storage_manager.request_to_emb_storage(group_rowIds, use_gpu)
-        return ly
+        return final_ly
 
 
 def calculate_and_write_cdf(cdf_output_dir, cache_algo, arr_latency):
@@ -317,58 +357,60 @@ class DLRM_Net(nn.Module):
         self.loss_ws = torch.tensor([1.0, 1.0])  # Placeholder
         return torch.nn.BCELoss(reduction="none")
     
-    def create_mlp(self, layer_sizes, sigmoid_layer):
-        """Create MLP with specified layer sizes"""
+    def create_mlp(self, layer_sizes, sigmoid_layer_idx):
+        """
+        Creates an MLP (Multi-Layer Perceptron) module.
+        """
         layers = nn.ModuleList()
         
         for i in range(len(layer_sizes) - 1):
-            n, m = int(layer_sizes[i]), int(layer_sizes[i + 1])
+            n_in, n_out = int(layer_sizes[i]), int(layer_sizes[i + 1])
             
-            # Create linear layer with Xavier initialization
-            linear_layer = nn.Linear(n, m, bias=True)
+            # Linear layer with deliberate weight initialization
+            linear_layer = nn.Linear(n_in, n_out, bias=True)
             
-            # Initialize weights
-            std_dev = np.sqrt(2 / (m + n))
-            W = np.random.normal(0.0, std_dev, size=(m, n)).astype(np.float32)
-            bt = np.random.normal(0.0, np.sqrt(1 / m), size=m).astype(np.float32)
+            # Xavier/Kaiming-like initialization for stability
+            std_dev = np.sqrt(2 / (n_out + n_in))
+            W = np.random.normal(0.0, std_dev, size=(n_out, n_in)).astype(np.float32)
+            b = np.random.normal(0.0, np.sqrt(1 / n_out), size=n_out).astype(np.float32)
             
             linear_layer.weight.data = torch.tensor(W, requires_grad=True)
-            linear_layer.bias.data = torch.tensor(bt, requires_grad=True)
+            linear_layer.bias.data = torch.tensor(b, requires_grad=True)
             layers.append(linear_layer)
             
-            # Add activation function
-            if i == sigmoid_layer:
+            # Non-linear activation
+            if i == sigmoid_layer_idx:
                 layers.append(nn.Sigmoid())
             else:
                 layers.append(nn.ReLU())
         
         return torch.nn.Sequential(*layers)
     
-    def create_emb(self, m, ln, weighted_pooling=None):
-        """Create embedding layers"""
-        emb_l = nn.ModuleList()
-        v_W_l = []
+    def create_emb(self, m_spa, ln_emb, weighted_pooling=None):
+        """
+        Creates a list of embedding layers (EmbeddingBag).
+        """
+        emb_list = nn.ModuleList()
+        v_W_list = []
         
-        print("Creating embedding layers...")
         if self.inference_only and self.use_evstore:
-            print("Inference-only mode: minimizing RAM usage")
+            print("[DLRM] Inference-only mode enabled: minimizing RAM footprint.")
         
-        for i in range(len(ln)):
+        for i, n_emb in enumerate(ln_emb):
             if ext_dist.my_size > 1 and i not in self.local_emb_indices:
                 continue
             
-            n = ln[i]
-            embedding_layer = self._create_single_embedding(n, m, i, ln)
+            # Create the actual embedding bag
+            ee = self._create_single_embedding(n_emb, m_spa, i, ln_emb)
+            emb_list.append(ee)
             
-            # Setup weights
+            # Initialize weights for pooling if requested
             if weighted_pooling is None:
-                v_W_l.append(None)
+                v_W_list.append(None)
             else:
-                v_W_l.append(torch.ones(n, dtype=torch.float32))
-            
-            emb_l.append(embedding_layer)
+                v_W_list.append(torch.ones(n_emb, dtype=torch.float32))
         
-        return emb_l, v_W_l
+        return emb_list, v_W_list
     
     def _create_single_embedding(self, n, m, i, ln):
         """Create a single embedding layer"""
@@ -501,115 +543,114 @@ def dash_separated_floats(value):
     return value
 
 
-def inference(args, dlrm, best_acc_test, best_auc_test, test_ld, device, use_gpu):
-    """Run inference on test data"""
+def inference(args, dlrm_model, best_acc, best_auc, loader, device, use_gpu):
+    """
+    Executes the inference pass on the provided data loader.
+    Supports cache warmup and workload tracing.
+    """
     test_accu = 0
     test_samp = 0
-    arr_latency = []
-    arr_inference_workload = []
+    latencies = []
+    workload_trace = []
     
-    # Handle cache warmup
-    warmup_number = int(len(test_ld) / 2) if args.cache_warmup else 0
+    # Optional cache warmup phase
+    warmup_iters = int(len(loader) / 2) if args.cache_warmup else 0
+    if warmup_iters > 0:
+        print(f"[DLRM] Warming up cache for {warmup_iters} iterations...")
+        _run_warmup(args, dlrm_model, loader, device, use_gpu, warmup_iters)
     
-    if warmup_number > 0:
-        print(f"==== Warmup iterations: {warmup_number}")
-        _run_inference_batches(args, dlrm, test_ld, device, use_gpu, 
-                              range(warmup_number), True)
-    
-    print(f"==== Test iterations: {len(test_ld) - warmup_number}")
+    test_iters = len(loader) - warmup_iters
+    print(f"[DLRM] Starting test phase: {test_iters} iterations.")
     
     # Main inference loop
-    for i, testBatch in enumerate(test_ld):
-        if i < warmup_number:
+    for i, batch in tqdm(enumerate(loader), total=len(loader), desc="Inference"):
+        if i < warmup_iters:
             continue
         
-        # Skip batches that don't fit distributed setup
-        X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(testBatch)
-        if ext_dist.my_size > 1 and X_test.size(0) % ext_dist.my_size != 0:
-            print(f"Warning: Skipping batch {i} with size {X_test.size(0)}")
+        X, lS_o, lS_i, targets, weights, _ = unpack_batch(batch)
+        
+        # Skip incomplete batches in distributed mode
+        if ext_dist.my_size > 1 and X.size(0) % ext_dist.my_size != 0:
             continue
         
         if args.trace_inference_workload:
-            # Trace workload for simulation
-            grouped_keys = _extract_workload_keys(lS_i_test)
-            arr_inference_workload.append(grouped_keys)
+            # Trace access patterns for simulation/analysis
+            workload_trace.append(_get_lookup_keys(lS_i))
         else:
-            # Run actual inference
-            start_time = time.time()
-            Z_test = dlrm_wrap(X_test, lS_o_test, lS_i_test, use_gpu, device, False)
-            end_time = time.time()
+            # Measure inference latency and accuracy
+            t_start = time.time()
+            predictions = dlrm_wrap(X, lS_o, lS_i, use_gpu, device, False)
+            t_end = time.time()
             
-            arr_latency.append(end_time - start_time)
+            latencies.append(t_end - t_start)
             
             if not args.ev_lookup_only:
-                # Process inference results
-                test_accu_batch, test_samp_batch = _process_inference_results(
-                    Z_test, T_test, X_test)
-                test_accu += test_accu_batch
-                test_samp += test_samp_batch
+                acc_batch, samp_batch = _compute_batch_accuracy(predictions, targets, X)
+                test_accu += acc_batch
+                test_samp += samp_batch
     
-    # Return results based on mode
     if args.trace_inference_workload:
-        return arr_inference_workload
+        return workload_trace
     
-    acc_test = test_accu / test_samp if test_samp > 0 else 0
+    # Aggregate and return metrics
+    final_acc = test_accu / test_samp if test_samp > 0 else 0
     
-    model_metrics_dict = {
+    metrics = {
         "nepochs": args.nepochs,
-        "nbatches": getattr(args, 'nbatches', 0),
-        "nbatches_test": getattr(args, 'nbatches_test', len(test_ld)),
-        "state_dict": dlrm.state_dict(),
-        "test_acc": acc_test,
+        "nbatches_test": len(loader),
+        "state_dict": dlrm_model.state_dict(),
+        "test_acc": final_acc,
     }
     
-    is_best = acc_test > best_acc_test
-    if is_best:
-        best_acc_test = acc_test
+    is_best_acc = final_acc > best_acc
+    if is_best_acc:
+        best_acc = final_acc
+        
+    print(f"[Results] Current Accuracy: {final_acc * 100:.3f}%, Best Accuracy: {best_acc * 100:.3f}%")
     
-    print(f"Accuracy: {acc_test * 100:.3f}%, Best: {best_acc_test * 100:.3f}%")
-    
-    return model_metrics_dict, is_best, "", None, arr_latency
+    return metrics, is_best_acc, "", None, latencies
 
 
-def _run_inference_batches(args, dlrm, test_ld, device, use_gpu, batch_range, is_warmup):
-    """Run inference on a range of batches"""
-    for i in batch_range:
-        if i >= len(test_ld):
+def _run_warmup(args, model, loader, device, use_gpu, iters):
+    """
+    Runs a subset of batches to prime the embedding cache.
+    """
+    loader_iter = iter(loader)
+    for _ in range(iters):
+        try:
+            batch = next(loader_iter)
+        except StopIteration:
             break
-        
-        testBatch = next(iter(test_ld))  # Simplified batch access
-        X_test, lS_o_test, lS_i_test, T_test, W_test, CBPP_test = unpack_batch(testBatch)
-        
-        dlrm_wrap(X_test, lS_o_test, lS_i_test, use_gpu, device, is_warmup)
+        X, lS_o, lS_i, _, _, _ = unpack_batch(batch)
+        dlrm_wrap(X, lS_o, lS_i, use_gpu, device, is_warmup=True)
 
 
-def _extract_workload_keys(lS_i_test):
-    """Extract workload keys for tracing"""
-    grouped_keys = []
-    for id, sparse_index in enumerate(lS_i_test.numpy(), 1):
-        grouped_keys.append(f"{id}-{sparse_index[0]}")
-    return grouped_keys
+def _get_lookup_keys(lS_i):
+    """
+    Extracts formatted keys for workload tracing.
+    """
+    return [f"{i+1}-{row[0]}" for i, row in enumerate(lS_i.numpy())]
 
 
-def _process_inference_results(Z_test, T_test, X_test):
-    """Process inference results to compute accuracy"""
+def _compute_batch_accuracy(predictions, targets, inputs):
+    """
+    Computes accuracy for a single batch, handling distributed results.
+    """
     with record_function("DLRM accuracy compute"):
-        # Handle distributed results
-        if Z_test.is_cuda:
+        if predictions.is_cuda:
             torch.cuda.synchronize()
         
-        _, batch_split_lengths = ext_dist.get_split_lengths(X_test.size(0))
+        _, split_lens = ext_dist.get_split_lengths(inputs.size(0))
         if ext_dist.my_size > 1:
-            Z_test = ext_dist.all_gather(Z_test, batch_split_lengths)
+            predictions = ext_dist.all_gather(predictions, split_lens)
         
-        # Compute accuracy
-        S_test = Z_test.detach().cpu().numpy()
-        T_test = T_test.detach().cpu().numpy()
+        S = predictions.detach().cpu().numpy()
+        T = targets.detach().cpu().numpy()
         
-        mbs_test = T_test.shape[0]
-        A_test = np.sum((np.round(S_test, 0) == T_test).astype(np.uint8))
+        batch_size = T.shape[0]
+        correct_count = np.sum((np.round(S, 0) == T).astype(np.uint8))
         
-        return A_test, mbs_test
+        return correct_count, batch_size
 
 
 def create_output_folder(args, input_data_name):
@@ -622,34 +663,36 @@ def create_output_folder(args, input_data_name):
 
 
 def setup_cache_algorithms(args):
-    """Initialize cache algorithms"""
+    """
+    Initializes and loads embedding cache algorithms.
+    """
     if not args.use_emb_cache:
         return
     
-    assert args.cache_size > 0, "Cache size must be positive"
+    print(f"[Cache] Initializing cache algorithms with size: {args.cache_size}")
     
-    # Initialize Python implementations
-    cache_modules = [EvLFU, LRU, LFU, FIFO]
-    for module in cache_modules:
-        module.init(args.cache_size)
+    # Initialize standard Python implementations
+    python_libs = [EvLFU, LRU, LFU, FIFO]
+    for lib in python_libs:
+        lib.init(args.cache_size)
     
-    # Initialize Cython implementations
-    cython_modules = [EvLFU_Cython, FIFO_Cython, LRU_Cython, 
-                     VineCache_Cython, VineCache_MFU_Cython]
-    for module in cython_modules:
-        module.cinit(args.cache_size)
+    # Initialize high-performance Cython implementations
+    cython_libs = [EvLFU_Cython, FIFO_Cython, LRU_Cython, VineCache_Cython, VineCache_MFU_Cython]
+    for lib in cython_libs:
+        lib.cinit(args.cache_size)
     
-    # Load embedding tables for specific algorithms
-    load_functions = {
-        "evlfu_cython": EvLFU_Cython.cload_ev_tables,
-        "fifo_cython": FIFO_Cython.cload_ev_tables,
-        "lru_cython": LRU_Cython.cload_ev_tables,
-        "vinecache_cython": VineCache_Cython.cload_ev_tables,
+    # Pre-load embedding tables for relevant algorithms
+    loader_map = {
+        "evlfu_cython":         EvLFU_Cython.cload_ev_tables,
+        "fifo_cython":          FIFO_Cython.cload_ev_tables,
+        "lru_cython":           LRU_Cython.cload_ev_tables,
+        "vinecache_cython":     VineCache_Cython.cload_ev_tables,
         "vinecache_mfu_cython": VineCache_MFU_Cython.cload_ev_tables
     }
     
-    if args.cache_algo in load_functions:
-        load_functions[args.cache_algo]()
+    if args.cache_algo in loader_map:
+        print(f"[Cache] Loading embedding tables for {args.cache_algo}...")
+        loader_map[args.cache_algo]()
 
 
 def setup_storage_manager(args):
@@ -733,9 +776,11 @@ def main():
     
     # Convert string arguments to boolean
     bool_args = ['inference_only', 'use_gpu', 'use_evstore', 'use_emb_cache', 
-                'ev_lookup_only', 'cache_warmup']
+                'ev_lookup_only', 'cache_warmup', 'arch_interaction_itself', 'debug_mode']
     for arg in bool_args:
-        setattr(args, arg, getattr(args, arg) == "True")
+        val = getattr(args, arg)
+        if isinstance(val, str):
+            setattr(args, arg, val.lower() in ["true", "1", "yes", "t"])
     
     cache_algo = args.cache_algo.lower()
     
@@ -854,30 +899,51 @@ def main():
         dlrm.load_state_dict(ld_model["state_dict"])
         print(f"Model loaded - Test accuracy: {ld_model['test_acc'] * 100:.3f}%")
     
-    # Run inference
+    # Run inference execution
     if args.inference_only:
-        print("\n========== Starting Inference ==========")
-        print(f"GPU: {use_gpu}, EVStore: {args.use_evstore}, Cache: {args.use_emb_cache}")
+        print("\n" + "="*40)
+        print("          DLRM INFERENCE START          ")
+        print("="*40)
+        print(f"Device: {device.type.upper()}")
+        print(f"EVStore: {'Enabled' if args.use_evstore else 'Disabled'}")
+        print(f"Cache: {'Enabled' if args.use_emb_cache else 'Disabled'}")
+        print(f"Algorithm: {cache_algo.upper()}")
+        print(f"Capacity: {args.cache_size}")
+        print("-"*40)
         
-        start_time = time.time()
+        t0 = time.time()
+        results = inference(args, dlrm, 0, 0, test_ld, device, use_gpu)
+        t1 = time.time()
         
-        model_metrics, is_best, auc_metrics, better_auc, arr_latency = inference(
-            args, dlrm, 0, 0, test_ld, device, use_gpu
-        )
-        
-        total_time = sum(arr_latency)
-        total_requests = len(arr_latency) * args.test_mini_batch_size
-        
-        print(f"\nResults:")
-        print(f"Total time: {total_time:.3f}s")
-        print(f"Average latency: {total_time * 1000 / len(arr_latency):.3f}ms")
-        print(f"Throughput: {total_requests / total_time:.1f} req/s")
-        print(f"Cache algorithm: {cache_algo.upper()}")
-        print(f"Cache size: {args.cache_size}")
-        print(f"Perfect hit rate: {perfect_hit / total_requests:.4f}")
-        print(f"Total hit rate: {total_hit / (total_requests * 26):.4f}")
+        # Unpack results
+        if args.trace_inference_workload:
+            print(f"[DLRM] Workload trace generated with {len(results)} samples.")
+        else:
+            _, _, _, _, latencies = results
+            
+            # Performance calculations
+            total_lat_ms = sum(latencies) * 1000
+            n_queries = len(latencies)
+            # Use mini-batch size if test-mini-batch-size is not specified
+            test_bs = args.test_mini_batch_size if args.test_mini_batch_size > 0 else args.mini_batch_size
+            total_request_samples = n_queries * test_bs
+            num_tables = ln_emb.size
+            total_lookups = total_request_samples * num_tables
+            
+            print("\n" + "="*40)
+            print("          PERFORMANCE REPORT            ")
+            print("="*40)
+            print(f"Total Queries:       {n_queries:,}")
+            print(f"Batch Size:          {test_bs}")
+            print(f"Total Lookups:       {total_lookups:,}")
+            print(f"Total Latency:       {total_lat_ms/1000:.3f} s")
+            print(f"Average Latency:     {total_lat_ms / n_queries:.4f} ms")
+            print(f"Throughput:          {total_request_samples / (t1 - t0):.2f} samples/s")
+            print(f"Perfect Hit Rate:    {perfect_hit / total_lookups:.4%}")
+            print(f"Overall Hit Rate:    {total_hit / total_lookups:.4%}")
+            print("="*40 + "\n")
     
-    print("========== Inference Complete ==========")
+    print("[DLRM] Execution finished successfully.")
 
 
 if __name__ == "__main__":

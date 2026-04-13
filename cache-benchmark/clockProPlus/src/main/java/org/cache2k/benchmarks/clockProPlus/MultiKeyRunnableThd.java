@@ -11,208 +11,164 @@ import java.util.Random;
  */
 class MultiKeyRunnableThd extends SingleKeyRunnableThd {
 
-    // Multi-key specific fields
+    // Multi-key Workload Details
     private final List<List<String>> groupedWorkloadKeys = new ArrayList<>();
     private final int groupSize;
-    private final List<Integer> hitCountDistribution = new ArrayList<>();
     private final IMultiKeyCache multiKeyCache;
     
-    // Benchmark configuration
-    private final int benchmarkWorkloadSize;
-    private int warmUpSize;
+    // Warm-up and Execution State
+    private int warmUpCount;
 
     /**
-     * Creates a new multi-key benchmark thread.
-     * 
-     * @param name Thread name for identification
-     * @param cache Multi-key cache instance to benchmark
-     * @param workloadKeys List of keys to use in benchmark
-     * @param groupSize Number of keys to group together for multi-key operations
-     * @param benchmarkWorkloadSize Size of the benchmark workload
+     * Initializes a multi-key benchmark thread.
+     *
+     * @param name                  The name of the thread.
+     * @param cache                 The cache implementation to benchmark.
+     * @param workloadKeys          The sequence of keys for the benchmark.
+     * @param groupSize             The size of each key group.
+     * @param benchmarkWorkloadSize The number of groups to process in the evaluation phase.
      */
     MultiKeyRunnableThd(String name, ISimpleCache cache, List<String> workloadKeys,
                        int groupSize, int benchmarkWorkloadSize) {
         super(name, cache, workloadKeys, benchmarkWorkloadSize);
         
         this.groupSize = groupSize;
-        this.benchmarkWorkloadSize = benchmarkWorkloadSize;
         this.multiKeyCache = (IMultiKeyCache) cache;
-        
-        // Initialize hit count distribution tracking
-        for (int i = 0; i <= groupSize; i++) {
-            hitCountDistribution.add(0);
-        }
-        
+
+        syncDistributionTracking(groupSize);
         groupWorkloadKeys();
-        System.out.println("Created multi-key benchmark thread: " + name + 
-                          " with " + groupedWorkloadKeys.size() + " groups, group size: " + groupSize);
+        
+        System.out.println("[Benchmark] Created multi-key thread: " + name + " (GroupSize=" + groupSize + ")");
+    }
+
+    private void syncDistributionTracking(int size) {
+        if (hitCountDistribution.size() != size + 1) {
+            hitCountDistribution.clear();
+            for (int i = 0; i <= size; i++) {
+                hitCountDistribution.add(0);
+            }
+        }
     }
 
     /**
-     * Groups the workload keys into chunks of specified group size.
+     * Groups workload keys into chunks of the specified size.
      */
     private void groupWorkloadKeys() {
         for (int i = 0; i < workloadKeys.size(); i += groupSize) {
-            List<String> currentGroup = new ArrayList<>();
-            
-            // Add keys to current group (up to groupSize)
-            for (int j = i; j < Math.min(i + groupSize, workloadKeys.size()); j++) {
-                currentGroup.add(workloadKeys.get(j));
-            }
-            
-            groupedWorkloadKeys.add(currentGroup);
+            int end = Math.min(i + groupSize, workloadKeys.size());
+            groupedWorkloadKeys.add(new ArrayList<>(workloadKeys.subList(i, end)));
         }
-        
-        System.out.println("Grouped " + workloadKeys.size() + " keys into " + 
-                          groupedWorkloadKeys.size() + " groups");
+        System.out.println("[Workload] Grouped " + workloadKeys.size() + " keys into " + groupedWorkloadKeys.size() + " groups.");
     }
 
     /**
-     * Warms up the cache using sequential access pattern for grouped keys.
-     * 
-     * @param warmUpPercentage Percentage of workload to use for warm-up (0-100)
+     * Performs a sequential warm-up of the multi-key cache.
+     *
+     * @param warmUpPercentage Percentage of benchmark workload to use (0-100).
      */
     @Override
     public void warmUpTheCache(int warmUpPercentage) {
-        System.out.println("Starting sequential warm-up with " + warmUpPercentage + "% of workload");
-        
-        warmUpSize = benchmarkWorkloadSize * warmUpPercentage / 100;
-        
-        for (int i = 0; i < warmUpSize && i < groupedWorkloadKeys.size(); i++) {
+        warmUpCount = (benchmarkWorkloadSize * warmUpPercentage / 100);
+        System.out.println("[Warm-up] Multi-key sequential start (" + warmUpPercentage + "%, size=" + warmUpCount + " groups)");
+
+        for (int i = 0; i < warmUpCount && i < groupedWorkloadKeys.size(); i++) {
             multiKeyCache.request(groupedWorkloadKeys.get(i));
         }
-        
-        System.out.println("Sequential warm-up completed");
+        System.out.println("[Warm-up] Multi-key sequential completed.");
     }
 
     /**
-     * Warms up the cache using random access pattern for grouped keys.
-     * 
-     * @param multiplier Multiple of cache size to use for warm-up
+     * Performs a random warm-up of the multi-key cache.
+     *
+     * @param multiplier Number of times the cache size to request.
      */
     public void warmUpTheCacheRandomly(int multiplier) {
-        warmUpSize = multiKeyCache.getCacheSize() * multiplier;
-        
-        System.out.println("Starting random warm-up with " + multiplier + "x cache size");
-        System.out.println("Warm-up size: " + warmUpSize + 
-                          ", Available groups: " + groupedWorkloadKeys.size() * groupSize);
-        
-        if (warmUpSize >= groupedWorkloadKeys.size() * groupSize) {
-            // Use sequential access if warm-up size exceeds available keys
-            System.out.println("Using sequential access (warm-up size >= available keys)");
-            int index = 0;
-            while (warmUpSize > 0 && index < groupedWorkloadKeys.size()) {
-                multiKeyCache.request(groupedWorkloadKeys.get(index));
-                index++;
-                warmUpSize -= groupSize;
-            }
+        warmUpCount = multiKeyCache.getCacheSize() * multiplier;
+        System.out.println("[Warm-up] Multi-key random start (" + multiplier + "x cache size, count=" + warmUpCount + " keys)");
+
+        int groupsToRequest = warmUpCount / groupSize;
+        if (groupsToRequest >= groupedWorkloadKeys.size()) {
+            System.out.println("[Warm-up] Switching to sequential (count exceeds available keys).");
+            groupedWorkloadKeys.forEach(multiKeyCache::request);
         } else {
-            // Use random access
-            Random random = new Random(warmUpSize); // Use warm-up size as seed for reproducibility
-            int maxIndex = groupedWorkloadKeys.size() - 1;
-            
-            while (warmUpSize > 0) {
-                int randomIndex = random.nextInt(maxIndex);
-                multiKeyCache.request(groupedWorkloadKeys.get(randomIndex));
-                warmUpSize -= groupSize;
+            Random random = new Random(warmUpCount);
+            int bound = groupedWorkloadKeys.size();
+            for (int i = 0; i < groupsToRequest; i++) {
+                multiKeyCache.request(groupedWorkloadKeys.get(random.nextInt(bound)));
             }
         }
-        
-        System.out.println("Random warm-up completed");
+        System.out.println("[Warm-up] Multi-key random completed.");
     }
 
     /**
-     * Analyzes workload patterns to understand key reuse within sliding windows.
-     * This method examines temporal locality in the grouped workload.
+     * Analyzes workload patterns to understand key reuse within a sliding window.
      */
     void analyzeWorkload() {
-        System.out.println("Starting workload analysis...");
+        System.out.println("[Analysis] Starting workload temporal locality analysis...");
         
-        HashMap<String, Integer> keyCountMap = new HashMap<>();
-        int[] hitCounts = new int[3]; // Track hits at different frequency levels
+        HashMap<String, Integer> keyFrequencyMap = new HashMap<>();
+        int[] frequencyHits = new int[3]; // [hits_at_f1, hits_at_f2, hits_at_f3+]
         
-        // Process workload in reverse order with sliding window
         for (int i = groupedWorkloadKeys.size() - 1; i >= 0; i--) {
-            List<String> currentGroup = groupedWorkloadKeys.get(i);
+            List<String> group = groupedWorkloadKeys.get(i);
             
-            // Count hits for current group based on previous occurrences
-            for (String key : currentGroup) {
-                if (keyCountMap.containsKey(key)) {
-                    int frequency = keyCountMap.get(key);
-                    if (frequency == 1) hitCounts[0]++;
-                    else if (frequency == 2) hitCounts[1]++;
-                    else hitCounts[2]++;
+            for (String key : group) {
+                int freq = keyFrequencyMap.getOrDefault(key, 0);
+                if (freq > 0) {
+                    frequencyHits[Math.min(freq - 1, 2)]++;
                 }
+                keyFrequencyMap.put(key, freq + 1);
             }
             
-            // Update key frequencies
-            for (String key : currentGroup) {
-                keyCountMap.put(key, keyCountMap.getOrDefault(key, 0) + 1);
-            }
-            
-            // Remove keys outside sliding window (10000 groups back)
+            // Sliding window cleanup (last 10000 groups)
             if (i + 10000 < groupedWorkloadKeys.size()) {
-                List<String> oldGroup = groupedWorkloadKeys.get(i + 10000);
-                for (String key : oldGroup) {
-                    int count = keyCountMap.get(key);
-                    keyCountMap.put(key, count - 1);
+                for (String key : groupedWorkloadKeys.get(i + 10000)) {
+                    keyFrequencyMap.computeIfPresent(key, (k, v) -> v - 1);
                 }
             }
         }
         
-        // Output analysis results as ratios
-        int totalGroups = groupedWorkloadKeys.size();
-        System.out.printf("Hit ratio (freq=1): %.6f%n", (double) hitCounts[0] / totalGroups / 26);
-        System.out.printf("Hit ratio (freq=2): %.6f%n", (double) hitCounts[1] / totalGroups / 26);
-        System.out.printf("Hit ratio (freq>=3): %.6f%n", (double) hitCounts[2] / totalGroups / 26);
-        System.out.println("Workload analysis completed");
+        double total = (double) groupedWorkloadKeys.size() * groupSize;
+        System.out.printf("[Analysis] Hit Ratios: F1=%.6f, F2=%.6f, F3+=%.6f%n", 
+            frequencyHits[0]/total, frequencyHits[1]/total, frequencyHits[2]/total);
     }
 
     /**
-     * Outputs the cumulative distribution function of hit counts.
+     * Prints the Cumulative Distribution Function (CDF) of group hit counts.
      */
     void outputHitCountCDF() {
-        System.out.println("Hit Count CDF:");
-        
-        int totalSamples = hitCountDistribution.stream().mapToInt(Integer::intValue).sum();
-        double cumulativeProbability = 0.0;
-        
-        // Print CDF in descending order
+        int totalGroups = hitCountDistribution.stream().mapToInt(Integer::intValue).sum();
+        if (totalGroups == 0) return;
+
+        System.out.println("[Stats] Multi-key Hit Count CDF:");
+        double cumulativeProb = 0.0;
         for (int i = groupSize; i >= 0; i--) {
-            cumulativeProbability += (double) hitCountDistribution.get(i) / totalSamples;
-            System.out.printf("P(hits >= %d) = %.4f%n", i, cumulativeProbability);
+            cumulativeProb += (double) hitCountDistribution.get(i) / totalGroups;
+            System.out.printf("  P(hits >= %d) = %.4f%n", i, cumulativeProb);
         }
     }
 
-    /**
-     * Main benchmark execution logic for multi-key operations.
-     * Processes grouped keys and records hit/miss patterns.
-     */
     @Override
     public void run() {
-        System.out.println("Starting multi-key benchmark thread: " + threadName);
+        System.out.println("[Execution] Multi-key thread " + threadName + " started.");
         
-        // Calculate the starting index for benchmark portion of workload
-        int startIndex = groupedWorkloadKeys.size() - benchmarkWorkloadSize;
+        int startIndex = Math.max(0, groupedWorkloadKeys.size() - benchmarkWorkloadSize);
         
-        // Process each group in the benchmark workload
         for (int i = startIndex; i < groupedWorkloadKeys.size(); i++) {
-            List<Boolean> groupHitResults = multiKeyCache.request(groupedWorkloadKeys.get(i));
+            List<Boolean> groupResults = multiKeyCache.request(groupedWorkloadKeys.get(i));
             
-            // Count hits in current group and record individual results
-            int groupHitCount = 0;
-            for (Boolean isHit : groupHitResults) {
+            int groupHits = 0;
+            for (Boolean isHit : groupResults) {
                 recordHitMiss.add(isHit);
                 if (isHit) {
-                    groupHitCount++;
+                    groupHits++;
+                    localHitCount++;
                 }
             }
             
-            // Update hit count distribution
-            int currentCount = hitCountDistribution.get(groupHitCount);
-            hitCountDistribution.set(groupHitCount, currentCount + 1);
+            hitCountDistribution.set(groupHits, hitCountDistribution.get(groupHits) + 1);
         }
         
-        System.out.println("Thread " + threadName + " completed multi-key benchmark");
+        System.out.println("[Execution] Multi-key thread " + threadName + " completed.");
     }
 }
