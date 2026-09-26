@@ -1,8 +1,9 @@
 # VineCache
-This is an open source repository for our paper
+This is an open source repository for our paper in [ICDE 2027](https://icde2027.github.io/)
 
-> **Bridging the Granularity Gap: Adaptive and Group-Aware Embedding Caching for Deep Recommendation Inference**
+> **VineCache: Adaptive and Group-Aware Embedding Caching for Deep Recommendation Inference**
 >
+> Menglei Chen, Yu Hua, Ming Zhang, Zhijun Yang
 
 ## Brief Introduction
 
